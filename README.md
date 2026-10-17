@@ -1,4 +1,4 @@
-# Hippocampus
+# Hippocampus 海马体
 
 让 agent 吸取教训。踩过的坑写进硬盘，下次不再踩。
 
