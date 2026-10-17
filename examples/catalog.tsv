@@ -1,0 +1,7 @@
+pack	date	type	name	title	bytes	gist
+misc	2026-02-14	reference	2026-02-14-random-observation.md	自动分类示例：未命中任何关键词	456	没有钉 pack 的 note 会按关键词自动分类；这篇不含任何 pack 关键词，所以落到 misc
+tooling	2026-02-10	feedback	2026-02-10-subagent-spec-needs-memory.md	subagent spec 必须带「必读记忆」节	797	派 subagent 时 spec 必须带「必读记忆」节：MEMORY.md + 相关 pack + 2-5 个 note 名；否则 subagent 会从零考古
+tooling	2026-02-02	reference	2026-02-02-cli-flag-renamed.md	示例 CLI 2.0：--out 改名 --output	574	示例 CLI 在 2.0 把 --out 改名为 --output，旧参数静默忽略；脚本里统一用 --output
+decisions	2026-01-20	feedback	2026-01-20-user-prefers-results.md	交付结果，不交建议清单（用户纠正 01-20）	594	用户纠正：要的是改好的代码和跑通的命令，不是分析报告；研究类任务做完问一句「要不要落地」
+infra	2026-01-15	project	2026-01-15-release-vs-restart.md	部署脚本只建 release，不重启服务	652	部署分两步：release.sh 只建 release 目录并切软链接，restart.sh 才让新进程生效；判断是否上线看进程工作目录，不看软链接
+infra	2026-01-08	reference	2026-01-08-healthz-port.md	健康检查端口：/healthz 只在 8081	703	示例服务的 /healthz 只在内部端口 8081 暴露；探活脚本必须打内网地址，打公网 443 永远 404

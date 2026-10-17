@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""mem — Hippocampus 的记忆 CLI（memory pack toolkit）。
+
+四层记忆结构（单一真源，根目录 = $MEM_HOME，默认 ~/.claude/memory）：
+  Tier-0  MEMORY.md        路由表（≤ router_budget_bytes），永远先读这个
+  Tier-1  packs/<id>.md    领域包（每包一页，条目＝note 的 description 一行）
+  Tier-2  catalog.tsv      机器索引（grep 这一个文件，取代 ls/grep 上千篇 note）
+  Tier-3  notes/*.md       原始 note（只读被指到的那一篇，禁止整目录读取）
+
+Tier-0/1/2 全部由 `mem build` 从 notes/ 生成，禁止手改。
+分类规则在 .memorypack/packs.json（缺失时用内置默认：全部归入 misc）。
+
+用法：
+  mem build                重建 catalog / packs / MEMORY.md（幂等）
+  mem find <kw> [...]      搜 catalog（不回传整篇 note）
+  mem ls [pack]            列领域包或某包的条目
+  mem pack <id>            打印领域包全文
+  mem show <name>          打印单篇 note
+  mem add <slug> [...]     生成带 front-matter 的新 note（强制协定）
+  mem doctor               预算／链接／分类健康检查
+  mem sweep                把误写进 notes/ 的索引类文件移到 archive/superseded/
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+
+__version__ = "1.0.0"
+
+DEFAULT_ROOT = Path(
+    os.environ.get("MEM_HOME")
+    or os.environ.get("MEMORY_ROOT")
+    or (Path.home() / ".claude" / "memory")
+)
+# 旧协定/其他 agent 误写进 notes/ 的索引类文件名：不当 note，build 时略过、doctor 会点名
+STRAY_NAMES = {"MEMORY.md", "memory_summary.md", "raw_memories.md", "instructions.md", "README.md"}
+FM_RE = re.compile(r"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n", re.S)
+H1_RE = re.compile(r"^#{1,3}[ \t]+(.+?)[ \t]*$", re.M)
+DATE_FULL_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+DATE_COMPACT_RE = re.compile(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)")
+DATE_MD_RE = re.compile(r"(?<!\d)(\d{2})(\d{2})(?!\d)")
+
+# packs.json 缺失时的内置默认：没有领域包，全部进 fallback
+DEFAULT_CFG: dict = {
+    "version": 1,
+    "router_budget_bytes": 12000,
+    "pack_budget_bytes": 32000,
+    "pack_gist_clamp": 300,
+    "gist_clamp": 420,
+    "hot_count": 12,
+    "packs": [],
+    "fallback": "misc",
+    "fallback_title": "未分类",
+    "fallback_read_when": "其他 pack 都查不到时；或 `mem find <关键字>`",
+    "legacy_links": [],
+}
+
+
+# ---------------------------------------------------------------- helpers
+def read_text(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return p.read_text(encoding="utf-8", errors="replace")
+
+
+def sha256(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def one_line(s: str, clamp: int) -> str:
+    s = re.sub(r"\s+", " ", s or "").strip()
+    s = re.sub(r"[*`_]{1,3}", "", s)
+    s = s.replace("\t", " ")
+    if len(s) > clamp:
+        s = s[: clamp - 1].rstrip() + "…"
+    return s
+
+
+def parse_front_matter(text: str) -> dict:
+    m = FM_RE.match(text)
+    if not m:
+        return {}
+    out: dict = {}
+    for raw in m.group(1).splitlines():
+        if not raw.strip() or raw.startswith((" ", "\t", "-")):
+            continue
+        if ":" not in raw:
+            continue
+        k, v = raw.split(":", 1)
+        out[k.strip()] = one_line(v, 1000)
+    # 嵌套键（metadata.pack / metadata.type）单独取，让作者可钉领域
+    for key in ("pack", "type"):
+        mm = re.search(rf"(?m)^\s+{key}:\s*([A-Za-z0-9_-]+)", m.group(1))
+        if mm:
+            out[f"meta.{key}"] = mm.group(1)
+    out["_raw_fm"] = m.group(1)
+    return out
+
+
+def body_of(text: str) -> str:
+    m = FM_RE.match(text)
+    return text[m.end():] if m else text
+
+
+def guess_date(path: Path, name: str) -> str:
+    m = DATE_FULL_RE.search(name)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    m = DATE_COMPACT_RE.search(name)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    # 名称常带项目代号（例：-1010-track-a-0926），取「最后一个合法月日」＝记录日
+    cands = [
+        (int(a), int(b))
+        for a, b in DATE_MD_RE.findall(name)
+        if 1 <= int(a) <= 12 and 1 <= int(b) <= 31
+    ]
+    if cands:
+        mo, dy = cands[-1]
+        y = datetime.fromtimestamp(path.stat().st_mtime).year
+        return f"{y}-{mo:02d}-{dy:02d}"
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
+    except OSError:
+        return "0000-00-00"
+
+
+def load_cfg(root: Path) -> dict:
+    p = root / ".memorypack" / "packs.json"
+    cfg = dict(DEFAULT_CFG)
+    if p.is_file():
+        cfg.update(json.loads(p.read_text(encoding="utf-8")))
+    return cfg
+
+
+def classify(hay: str, cfg: dict) -> str:
+    low = hay.lower()
+    best, best_score = cfg.get("fallback", "misc"), 0
+    for pk in cfg["packs"]:
+        score = 0
+        for kw in pk.get("strong", []):
+            if kw.lower() in low:
+                score += 3
+        for kw in pk.get("keywords", []):
+            if kw.lower() in low:
+                score += 1
+        if score > best_score:
+            best, best_score = pk["id"], score
+    return best
+
+
+def scan(root: Path, cfg: dict) -> list[dict]:
+    notes_dir = root / "notes"
+    clamp = int(cfg.get("gist_clamp", 420))
+    rows: list[dict] = []
+    valid_ids = {pk["id"] for pk in cfg["packs"]} | {cfg.get("fallback", "misc")}
+    for p in sorted(notes_dir.glob("*.md")):
+        if p.name.startswith(".") or p.name in STRAY_NAMES:
+            continue
+        text = read_text(p)
+        fm = parse_front_matter(text)
+        body = body_of(text)
+        h1 = H1_RE.search(body)
+        title = one_line(h1.group(1), 160) if h1 else ""
+        if not title:
+            title = re.sub(r"^\d{4}-\d{2}-\d{2}[-_ ]*", "", p.stem).replace("-", " ").replace("_", " ")
+            title = one_line(title, 160)
+        gist = fm.get("description") or ""
+        if not gist:
+            for line in body.splitlines():
+                s = line.strip()
+                if not s or s.startswith(("#", ">", "-", "*", "|", "```", "---")):
+                    continue
+                gist = s
+                break
+        gist = one_line(gist, clamp)
+        hay = "\n".join([p.name, fm.get("name", ""), title, gist, body[:800]])
+        pinned = fm.get("meta.pack")
+        rows.append(
+            {
+                "name": p.name,
+                "path": f"notes/{p.name}",
+                "date": guess_date(p, p.stem),
+                "title": title,
+                "type": fm.get("meta.type") or fm.get("metadata.type") or fm.get("type") or "",
+                "gist": gist,
+                "pack": pinned if pinned in valid_ids else classify(hay, cfg),
+                "bytes": p.stat().st_size,
+                "sha": sha256(p)[:12],
+            }
+        )
+    return rows
+
+
+# ---------------------------------------------------------------- build
+def build(root: Path, quiet: bool = False) -> dict:
+    cfg = load_cfg(root)
+    rows = scan(root, cfg)
+    (root / "packs").mkdir(parents=True, exist_ok=True)
+    (root / ".memorypack").mkdir(parents=True, exist_ok=True)
+    rank = {pk["id"]: i for i, pk in enumerate(cfg["packs"])}
+    rank[cfg.get("fallback", "misc")] = len(rank)
+    rows.sort(key=lambda r: (rank.get(r["pack"], 999), r["date"], r["name"]))
+
+    # Tier-2 catalog.tsv
+    cat = root / "catalog.tsv"
+    with cat.open("w", encoding="utf-8") as fh:
+        fh.write("pack\tdate\ttype\tname\ttitle\tbytes\tgist\n")
+        for r in sorted(rows, key=lambda x: (x["date"], x["name"]), reverse=True):
+            fh.write(
+                "\t".join(
+                    [
+                        r["pack"], r["date"], r["type"], r["name"], r["title"],
+                        str(r["bytes"]), r["gist"].replace("\n", " "),
+                    ]
+                )
+                + "\n"
+            )
+
+    # Tier-1 packs（整目录重写，所以手改会被覆盖）
+    for old in (root / "packs").glob("*.md"):
+        old.unlink()
+    meta = {pk["id"]: pk for pk in cfg["packs"]}
+    meta[cfg.get("fallback", "misc")] = {
+        "id": cfg.get("fallback", "misc"),
+        "title": cfg.get("fallback_title", "未分类"),
+        "read_when": cfg.get("fallback_read_when", ""),
+    }
+    budgets: list[str] = []
+    for pid in sorted({r["pack"] for r in rows}, key=lambda x: rank.get(x, 999)):
+        group = [r for r in rows if r["pack"] == pid]
+        group.sort(key=lambda r: (r["date"], r["name"]), reverse=True)
+        pk = meta.get(pid, {"title": pid, "read_when": ""})
+        lines = [
+            f"# {pk['title']}（{pid}）",
+            "",
+            f"> 条目 {len(group)}｜最近 {group[0]['date'] if group else '-'}｜"
+            f"生成 {datetime.now().strftime('%Y-%m-%d %H:%M')}（`mem build` 生成，勿手改）",
+            f"> 什么时候读：{pk.get('read_when','')}",
+            "> 定位单一条目用 `mem find <关键字>`（grep catalog.tsv）；本文件可扫读，别整篇背。",
+            "",
+        ]
+        for r in group:
+            t = f" · {r['title']}" if r["title"] and r["title"] != r["name"] else ""
+            lines.append(f"### {r['date']}{t}")
+            lines.append(f"- {one_line(r['gist'], int(cfg.get('pack_gist_clamp', 300)))}")
+            lines.append(f"  - → `{r['path']}`")
+            lines.append("")
+        body = "\n".join(lines)
+        (root / "packs" / f"{pid}.md").write_text(body, encoding="utf-8")
+        b = len(body.encode())
+        budgets.append(f"{pid}:{b}")
+        if b > int(cfg.get("pack_budget_bytes", 32000)):
+            print(f"WARN pack 超预算 {pid} = {b} bytes", file=sys.stderr)
+
+    # Tier-0 router
+    bl = int(cfg.get("router_budget_bytes", 12000))
+    out = [
+        "# 长期记忆（Tier-0 路由表）",
+        "",
+        f"> 单一真源 `notes/`（{len(rows)} 篇 / "
+        f"{sum(r['bytes'] for r in rows)//1024} KB）。本文件由 `mem build` 生成，**禁止手改**。",
+        f"> 生成时间 {datetime.now().strftime('%Y-%m-%d %H:%M')}｜预算 {bl} bytes。",
+        "",
+        "## 读取协定",
+        "1. 先读本文件（Tier-0，全部）。",
+        "2. 要细节 → `mem find <关键字>`（grep `catalog.tsv`，一行一篇，不回传全文）或读 `packs/<id>.md`。",
+        "3. 原始 note 在 `notes/`，**一次只读 catalog 指到的那几篇**；禁止整目录读取。",
+        "",
+        "## 写入协定",
+        "- 新记忆：`mem add <slug> --type project|feedback|reference [--pack <id>]` → 在 `notes/` 生成带 front-matter 的文件；填好 `description`。",
+        "- 写完跑 `mem build`；**永不手改 `MEMORY.md` / `packs/*` / `catalog.tsv`**（改了下次 build 就被覆盖）。",
+    ]
+    for extra in cfg.get("router_notes", []):
+        out.append(f"- {extra}")
+    out += [
+        "",
+        "## 领域包（Tier-1）",
+        "",
+        "| pack | 条目 | 最近 | 什么时候读 |",
+        "|---|---|---|---|",
+    ]
+    for pid in sorted({r["pack"] for r in rows}, key=lambda x: rank.get(x, 999)):
+        group = [r for r in rows if r["pack"] == pid]
+        latest = max(r["date"] for r in group)
+        pk = meta.get(pid, {"title": pid, "read_when": ""})
+        out.append(
+            f"| [`{pid}`](packs/{pid}.md) · {pk['title']} | {len(group)} | {latest} | {pk.get('read_when','')} |"
+        )
+    out += [
+        "",
+        "## 热档（近期）",
+        "",
+    ]
+    for r in sorted(rows, key=lambda x: x["date"], reverse=True)[: int(cfg.get("hot_count", 12))]:
+        out.append(f"- {r['date']} [{r['title'] or r['name']}]({r['path']}) — {one_line(r['gist'], 180)}")
+    out += ["", f"<!-- 末行：{len(rows)} notes / {len({r['pack'] for r in rows})} packs -->", ""]
+    router = "\n".join(out)
+    if len(router.encode()) > bl:
+        print(
+            f"WARN MEMORY.md {len(router.encode())} bytes 超预算 {bl}；请下调 hot_count 或缩短 read_when",
+            file=sys.stderr,
+        )
+    (root / "MEMORY.md").write_text(router, encoding="utf-8")
+
+    dupes = len(rows) - len({r["sha"] for r in rows})
+    stats = {
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "notes": len(rows),
+        "packs": len({r["pack"] for r in rows}),
+        "unclassified": sum(1 for r in rows if r["pack"] == cfg.get("fallback", "misc")),
+        "no_description": sum(1 for r in rows if not r["gist"]),
+        "duplicate_content": dupes,
+        "router_bytes": len(router.encode()),
+        "pack_bytes": budgets,
+    }
+    (root / ".memorypack" / "state.json").write_text(
+        json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    if not quiet:
+        print(json.dumps(stats, ensure_ascii=False, indent=2))
+    return stats
+
+
+# ---------------------------------------------------------------- commands
+def load_catalog(root: Path) -> list[dict]:
+    p = root / "catalog.tsv"
+    if not p.exists():
+        build(root, quiet=True)
+    rows = []
+    with p.open(encoding="utf-8") as fh:
+        hdr = fh.readline().rstrip("\n").split("\t")
+        for line in fh:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < len(hdr):
+                parts += [""] * (len(hdr) - len(parts))
+            rows.append(dict(zip(hdr, parts)))
+    return rows
+
+
+def cmd_find(root: Path, kws: list[str], pack: str | None, limit: int) -> int:
+    rows = load_catalog(root)
+    hits = []
+    for r in rows:
+        if pack and r["pack"] != pack:
+            continue
+        hay = "\t".join(r.values()).lower()
+        score = sum(hay.count(k.lower()) for k in kws)
+        if score:
+            hits.append((score, r))
+    hits.sort(key=lambda x: x[1]["date"], reverse=True)
+    hits.sort(key=lambda x: -x[0])
+    if not hits:
+        print(f"no hit for {' '.join(kws)}（试更短的词，或用 `mem ls` 看领域）")
+        return 1
+    print(f"# {len(hits)} 命中（只列前 {min(limit,len(hits))}；全文：mem show <name>）")
+    for _, r in hits[:limit]:
+        print(f"- [{r['pack']}] {r['date']} {r['title'] or r['name']}")
+        print(f"    {one_line(r['gist'], 240)}")
+        print(f"    -> {r['name']}")
+    return 0
+
+
+def cmd_ls(root: Path, pack: str | None) -> int:
+    rows = load_catalog(root)
+    if not pack:
+        counts: dict[str, int] = {}
+        for r in rows:
+            counts[r["pack"]] = counts.get(r["pack"], 0) + 1
+        for pid, n in sorted(counts.items(), key=lambda x: -x[1]):
+            print(f"{pid}\t{n}")
+        return 0
+    group = [r for r in rows if r["pack"] == pack]
+    for r in sorted(group, key=lambda x: x["date"], reverse=True):
+        print(f"{r['date']}\t{r['name']}\t{one_line(r['gist'], 120)}")
+    return 0
+
+
+def cmd_pack(root: Path, pid: str) -> int:
+    p = root / "packs" / f"{pid}.md"
+    if not p.exists():
+        avail = ", ".join(sorted(x.stem for x in (root / "packs").glob("*.md")))
+        print(f"no such pack: {pid}（可用：{avail}）")
+        return 1
+    sys.stdout.write(p.read_text(encoding="utf-8"))
+    return 0
+
+
+def cmd_show(root: Path, name: str) -> int:
+    cand = [root / "notes" / name, root / name]
+    for c in cand:
+        if c.is_file():
+            sys.stdout.write(c.read_text(encoding="utf-8", errors="replace"))
+            return 0
+    m = list((root / "notes").glob(f"*{name}*"))
+    if len(m) == 1:
+        sys.stdout.write(m[0].read_text(encoding="utf-8", errors="replace"))
+        return 0
+    print(f"not found / ambiguous: {name}" + (f"（{len(m)} 个命中）" if m else ""))
+    for x in m[:10]:
+        print("  ", x.name)
+    return 1
+
+
+ADD_TMPL = """---
+name: {slug}
+description: （一句话：这篇记的是什么、之后什么情境要用它）
+metadata:
+  type: {type}
+  pack: {pack}
+---
+
+# {title}
+
+## FACT（现场证据；标明来源文件/命令/ID）
+
+## 决策／结论
+
+## 坑（下次怎么避开）
+
+## 相关
+- [[]]
+"""
+
+
+def cmd_add(root: Path, slug: str, type_: str, pack: str, title: str | None) -> int:
+    (root / "notes").mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "-", slug).strip("-")
+    if not DATE_FULL_RE.search(safe):
+        safe = f"{datetime.now():%Y-%m-%d}-{safe}"
+    dest = root / "notes" / f"{safe}.md"
+    if dest.exists():
+        print(f"已存在，未覆盖：{dest}")
+        return 1
+    dest.write_text(
+        ADD_TMPL.format(slug=safe, type=type_, pack=pack, title=title or safe),
+        encoding="utf-8",
+    )
+    print(dest)
+    return 0
+
+
+def cmd_doctor(root: Path) -> int:
+    cfg = load_cfg(root)
+    st = build(root, quiet=True)
+    ok = True
+    bl = int(cfg.get("router_budget_bytes", 12000))
+    print(f"notes          : {st['notes']} 篇 / {st['unclassified']} 未分类 / {st['no_description']} 缺 description")
+    print(f"packs          : {st['packs']}")
+    print(f"duplicate sha  : {st['duplicate_content']}")
+    rb = st["router_bytes"]
+    print(f"MEMORY.md      : {rb} bytes / 预算 {bl} {'OK' if rb <= bl else 'OVER'}")
+    if rb > bl:
+        ok = False
+    rows = load_catalog(root)
+    names = {r["name"] for r in rows}
+    broken = 0
+    for f in (root / "packs").glob("*.md"):
+        for m in re.finditer(r"`notes/([^`]+)`", f.read_text(encoding="utf-8")):
+            if "<" in m.group(1) or ">" in m.group(1):
+                continue
+            if m.group(1) not in names:
+                broken += 1
+                print("BROKEN:", f.name, m.group(1))
+    placeholder = sum(1 for r in rows if r.get("gist", "").startswith("（一句话"))
+    if placeholder:
+        print(f"placeholder    : {placeholder} 篇 description 仍是 mem add 模板占位，请填写")
+    print(f"broken links   : {broken}")
+    if broken:
+        ok = False
+    stray = sorted(p.name for p in (root / "notes").glob("*.md") if p.name in STRAY_NAMES)
+    if stray:
+        print(f"STRAY          : {stray}（旧协定误写；跑 `mem sweep` 收进 archive/superseded/）")
+        ok = False
+    # 可选：旧记忆库路径应当是指向本库的 symlink（packs.json 的 legacy_links）
+    for item in cfg.get("legacy_links", []):
+        lp = Path(os.path.expanduser(item["path"]))
+        tgt_rel = item.get("target", ".")
+        want = root if tgt_rel in (".", "") else root / tgt_rel
+        if lp.is_symlink():
+            tgt = os.path.realpath(lp)
+            good = tgt == os.path.realpath(want)
+            print(f"symlink {'OK ' if good else 'BAD'} {lp} -> {tgt}")
+            if not good:
+                ok = False
+        elif lp.exists():
+            print(f"WARN 旧库仍为实体目录（会分叉）: {lp}")
+            ok = False
+        else:
+            print(f"MISS {lp}")
+    print("VERDICT:", "OK" if ok else "NEEDS FIX")
+    return 0 if ok else 1
+
+
+def cmd_sweep(root: Path) -> int:
+    """把误写进 notes/ 的索引类文件（旧协定遗留）收进 archive/superseded/。"""
+    sup = root / "archive" / "superseded"
+    sup.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for p in sorted((root / "notes").glob("*.md")):
+        if p.name in STRAY_NAMES:
+            tgt = sup / f"stray-{datetime.now():%Y%m%d-%H%M%S}__{p.name}"
+            shutil.move(str(p), str(tgt))
+            print(f"moved {p.name} -> {tgt}")
+            n += 1
+    print(f"swept {n}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="mem", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--root", default=str(DEFAULT_ROOT), help="记忆根目录（默认 $MEM_HOME 或 ~/.claude/memory）")
+    ap.add_argument("--version", action="version", version=f"mem {__version__}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("build", help="重建 catalog / packs / MEMORY.md")
+    p = sub.add_parser("find", help="搜 catalog.tsv"); p.add_argument("kw", nargs="+"); p.add_argument("--pack"); p.add_argument("--limit", type=int, default=20)
+    p = sub.add_parser("ls", help="列领域包或某包条目"); p.add_argument("pack", nargs="?")
+    p = sub.add_parser("pack", help="打印领域包"); p.add_argument("id")
+    p = sub.add_parser("show", help="打印单篇 note"); p.add_argument("name")
+    p = sub.add_parser("add", help="新建 note"); p.add_argument("slug"); p.add_argument("--type", default="project"); p.add_argument("--pack", default="misc"); p.add_argument("--title")
+    sub.add_parser("doctor", help="健康检查")
+    sub.add_parser("sweep", help="清理误写进 notes/ 的索引文件")
+    a = ap.parse_args()
+    root = Path(a.root).expanduser()
+    if a.cmd == "build":
+        build(root); return 0
+    if a.cmd == "find":
+        return cmd_find(root, a.kw, a.pack, a.limit)
+    if a.cmd == "ls":
+        return cmd_ls(root, a.pack)
+    if a.cmd == "pack":
+        return cmd_pack(root, a.id)
+    if a.cmd == "show":
+        return cmd_show(root, a.name)
+    if a.cmd == "add":
+        return cmd_add(root, a.slug, a.type, a.pack, a.title)
+    if a.cmd == "doctor":
+        return cmd_doctor(root)
+    if a.cmd == "sweep":
+        return cmd_sweep(root)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

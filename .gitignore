@@ -1,0 +1,14 @@
+# mem build 生成的运行状态（含时间戳）
+examples/.memorypack/state.json
+.memorypack/state.json
+
+# Python
+__pycache__/
+*.pyc
+
+# 本地测试与打包产物
+*.bak.*
+/dist/
+*.tar.gz
+*.zip
+.DS_Store

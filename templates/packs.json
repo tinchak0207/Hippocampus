@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "router_budget_bytes": 12000,
+  "pack_budget_bytes": 32000,
+  "pack_gist_clamp": 300,
+  "gist_clamp": 420,
+  "hot_count": 12,
+  "packs": [
+    {
+      "id": "decisions",
+      "title": "决策／偏好／工作纪律",
+      "read_when": "决定做不做、定口径、被用户纠正过的行为、取舍时",
+      "strong": [
+        "产品决策",
+        "decision",
+        "用户偏好",
+        "用户纠正",
+        "feedback"
+      ],
+      "keywords": [
+        "决定",
+        "原则",
+        "偏好",
+        "禁止",
+        "优先级",
+        "取舍",
+        "规则",
+        "rule",
+        "policy",
+        "prefer"
+      ]
+    },
+    {
+      "id": "infra",
+      "title": "基础设施／部署",
+      "read_when": "碰服务器、部署、域名、CI、容器、日志时",
+      "strong": [
+        "deploy",
+        "部署",
+        "systemd",
+        "docker",
+        "ci/cd"
+      ],
+      "keywords": [
+        "server",
+        "服务器",
+        "nginx",
+        "dns",
+        "域名",
+        "容器",
+        "log",
+        "日志",
+        "回滚",
+        "rollback",
+        "ssh",
+        "healthz"
+      ]
+    },
+    {
+      "id": "tooling",
+      "title": "Agent／工具／脚本",
+      "read_when": "碰 agent 行为、工具、skill、MCP、脚本时",
+      "strong": [
+        "subagent",
+        "mcp",
+        "skill",
+        "harness"
+      ],
+      "keywords": [
+        "agent",
+        "tool",
+        "工具",
+        "脚本",
+        "script",
+        "cli",
+        "prompt",
+        "提示词",
+        "session",
+        "会话",
+        "plugin"
+      ]
+    }
+  ],
+  "fallback": "misc",
+  "fallback_title": "未分类",
+  "fallback_read_when": "上面的 pack 都查不到时；或 `mem find <关键字>`",
+  "router_notes": [],
+  "legacy_links": [],
+  "_comment": "strong 命中 +3，keywords 命中 +1，取最高分；不要把 note 模板里的固定小节名（FACT/决策/坑/相关）当关键词，否则所有 note 都会被拉进同一个 pack。"
+}
