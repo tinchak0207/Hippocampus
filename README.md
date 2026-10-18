@@ -279,6 +279,14 @@ git clone https://github.com/tinchak0207/Hippocampus.git && cd Hippocampus
 ./install.sh [--agents-file PATH] [--hooks] [--skill-dir DIR] [--examples]
 ```
 
+## 社区支持
+
+学 AI，上 L 站：[LinuxDO](https://linux.do/)
+
+## 📄 开源许可证
+
+本项目基于 [MIT 许可证](LICENSE) 开源。
+
 Python ≥ 3.8. Idempotent; never overwrites existing files. Prompts, the rules snippet, and CLI output are in Chinese.
 
 ### License
